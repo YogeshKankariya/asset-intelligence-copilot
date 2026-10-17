@@ -13,11 +13,26 @@ DATASET_ROOT = Path(
     r"C:\Users\Admin\flytbase-ahc-swe-asset-intelligence-dataset"
 )
 
-# Confirmed T200 rule from Section 9.3 of T200.md.
-# T350 is intentionally not configured until its rule is verified.
-WELL_TYPE_THRESHOLDS = {
+# Verified well-type production threshold rules:
+# - T200: Section 9.3 of T200.md (at least 15.0°C above ambient)
+# - T350: Section 3 of T350.md (at least 20.0°C above ambient)
+WELL_TYPE_THRESHOLDS: dict[str, float] = {
     "T200": 15.0,
+    "T350": 20.0,
 }
+
+
+def get_well_type_threshold(well_type: Any) -> float:
+    """Retrieve the verified production threshold for a given well type.
+
+    Raises HTTPException(422) if the well type is unsupported or unconfigured.
+    """
+    if not isinstance(well_type, str) or well_type not in WELL_TYPE_THRESHOLDS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"No verified production threshold configured for {well_type}",
+        )
+    return WELL_TYPE_THRESHOLDS[well_type]
 
 
 def load_json(path: Path) -> dict[str, Any]:
@@ -101,13 +116,7 @@ def get_well_status(asset_id: str):
         raise HTTPException(status_code=500, detail="Asset ID mismatch")
 
     well_type = metadata.get("well_type")
-    threshold = WELL_TYPE_THRESHOLDS.get(well_type)
-
-    if threshold is None:
-        raise HTTPException(
-            status_code=422,
-            detail=f"No verified production threshold configured for {well_type}",
-        )
+    threshold = get_well_type_threshold(well_type)
 
     inspections = load_inspections(inspections_path)
 
