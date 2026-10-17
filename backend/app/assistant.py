@@ -84,12 +84,16 @@ def classify_question(question: str, has_asset_id: bool) -> str:
     )
 
     # 3. Maintenance recurrence / RCA
+    # Note: If the query targets a specific maintenance report (e.g. MNT-xxxx), route to document retrieval
     is_maintenance = bool(
-        re.search(r"\b(rca|root[\s-]cause)\b", q)
-        or re.search(r"\b(recurring|recurrent|repeated)\b.*\b(maintenance|repair|issue|failure)\b", q)
-        or re.search(r"\bmaintenance recurrence\b", q)
-        or re.search(r"\bcorrective maintenance\b", q)
-        or re.search(r"\b(3|three)\b.*\b(repairs?|events?|corrective)\b", q)
+        not re.search(r"\bmnt-[\w-]+\b", q)
+        and (
+            re.search(r"\b(rca|root[\s-]cause)\b", q)
+            or re.search(r"\b(recurring|recurrent|repeated)\b.*\b(maintenance|repair|issue|failure)\b", q)
+            or re.search(r"\bmaintenance recurrence\b", q)
+            or re.search(r"\bcorrective maintenance\b", q)
+            or re.search(r"\b(3|three)\b.*\b(repairs?|events?|corrective)\b", q)
+        )
     )
 
     # 4. Safety & Compliance (High Temp / Pad Spills / Reportable Spills)
@@ -422,13 +426,83 @@ def _handle_safety_compliance(
     )
 
 
+def _handle_document_retrieval(
+    question: str,
+    asset_id: str | None,
+    dataset_root: Path | None,
+) -> AssistantAskResponse:
+    from app.document_retrieval import retrieve_documents, detect_documentary_conflicts
+
+    results = retrieve_documents(
+        query=question,
+        asset_id=asset_id,
+        dataset_root=dataset_root,
+        top_k=4,
+        min_score=1.5,
+    )
+
+    if not results:
+        return AssistantAskResponse(
+            question=question,
+            asset_id=asset_id,
+            question_type="unsupported",
+            status="unsupported",
+            answer=(
+                "This question is outside the operational scope of Asset Intelligence Copilot. "
+                "Insufficient documentary evidence found in the operational manuals, SOPs, or reports "
+                "to answer this question. The assistant avoids making unsupported inferences or fabricating information."
+            ),
+            evidence=[],
+        )
+
+    conflicts, unresolved_conflicts = detect_documentary_conflicts(results)
+
+    top_result = results[0]
+    ans_lines = [
+        f"Based on **{top_result.get('document_title', 'Operational Records')}** "
+        f"({top_result.get('section', 'General')}) [Source: `{top_result.get('source')}`]:",
+        f"> {top_result.get('excerpt')}",
+    ]
+
+    if len(results) > 1:
+        other_citations = []
+        for r in results[1:]:
+            if r.get("source") != top_result.get("source") or r.get("section") != top_result.get("section"):
+                other_citations.append(f"- **{r.get('document_title')}** ({r.get('section')}) [Source: `{r.get('source')}`]")
+        if other_citations:
+            ans_lines.append("\nAdditional relevant sources:")
+            ans_lines.extend(other_citations[:3])
+
+    if conflicts:
+        ans_lines.append("\nDocumentary Disclosures & Conflicts:")
+        for c in conflicts:
+            ans_lines.append(f"- {c.get('description')}")
+
+    ans_lines.append(
+        "\nEvidence Grounding: All statements are directly grounded in the source passages cited above."
+    )
+
+    return AssistantAskResponse(
+        question=question,
+        asset_id=asset_id or top_result.get("asset_id"),
+        question_type="document_retrieval",
+        status="answered",
+        answer="\n".join(ans_lines),
+        rule_or_calculation=f"Lexical retrieval (BM25) matching '{top_result.get('section')}' in {top_result.get('source')}",
+        evidence=results,
+        conflicts=conflicts,
+        unresolved_conflicts=unresolved_conflicts,
+        details={"retrieved_count": len(results), "top_score": top_result.get("score")},
+    )
+
+
 def process_assistant_question(
     question: str,
     asset_id: str | None = None,
     dataset_root: Path | None = None,
 ) -> AssistantAskResponse:
-    """Processes a natural language question, routes it to the appropriate deterministic function,
-    and returns a structured, evidence-grounded response.
+    """Processes a natural language question, routes it to the appropriate deterministic function
+    or document retrieval layer, and returns a structured, evidence-grounded response.
     """
     clean_question = question.strip() if question else ""
     if not clean_question:
@@ -450,42 +524,46 @@ def process_assistant_question(
     has_asset_id = target_asset_id is not None
     q_type = classify_question(clean_question, has_asset_id=has_asset_id)
 
-    # 1. Ambiguous question
+    # 1. Ambiguous multi-domain operational question or generic well overview query
+    q_lower = clean_question.lower()
     if q_type == "ambiguous":
-        asset_clause = f" for {target_asset_id}" if target_asset_id else ""
-        return AssistantAskResponse(
-            question=clean_question,
-            asset_id=target_asset_id,
-            question_type="ambiguous",
-            status="ambiguous",
-            answer=(
-                f"Your question{asset_clause} is ambiguous. The assistant supports five specific operational areas: "
-                "1) Current production status, "
-                "2) Estimated downtime, "
-                "3) Consecutive downtime reporting thresholds (>14 days), "
-                "4) Recurring maintenance and root-cause analysis (RCA) requirements, and "
-                "5) Safety alerts and spill compliance (high temperature alarms and SR-01 spill reporting). "
-                "Please clarify which operational area you are asking about."
-            ),
-        )
+        # Check if it was purely a generic query like "Tell me about WELL-0001"
+        if re.search(r"^(tell me about|what about|how is|summary of|overview of)\b", q_lower) and target_asset_id:
+            return AssistantAskResponse(
+                question=clean_question,
+                asset_id=target_asset_id,
+                question_type="ambiguous",
+                status="ambiguous",
+                answer=(
+                    f"Your question for {target_asset_id} is ambiguous. The assistant supports five specific operational areas: "
+                    "1) Current production status, "
+                    "2) Estimated downtime, "
+                    "3) Consecutive downtime reporting thresholds (>14 days), "
+                    "4) Recurring maintenance and root-cause analysis (RCA) requirements, and "
+                    "5) Safety alerts and spill compliance (high temperature alarms and SR-01 spill reporting). "
+                    "Please clarify which operational area you are asking about."
+                ),
+            )
+        # Check if it was a multi-domain collision (e.g. downtime and maintenance recurrence)
+        if "downtime" in q_lower and ("maintenance" in q_lower or "rca" in q_lower):
+            return AssistantAskResponse(
+                question=clean_question,
+                asset_id=target_asset_id,
+                question_type="ambiguous",
+                status="ambiguous",
+                answer=(
+                    "Your question asks about multiple operational areas. Please ask about one specific area at a time."
+                ),
+            )
 
-    # 2. Unsupported question
-    if q_type == "unsupported":
-        return AssistantAskResponse(
-            question=clean_question,
-            asset_id=target_asset_id,
-            question_type="unsupported",
-            status="unsupported",
-            answer=(
-                "This question is outside the operational scope of Asset Intelligence Copilot. "
-                "The assistant is specialized in oil-field operational intelligence, specifically: "
-                "well production status, downtime estimation, consecutive downtime reporting thresholds, "
-                "corrective maintenance recurrence/RCA, and safety/spill compliance."
-            ),
-        )
-
-    # 3. Operational question requiring an asset ID when none is provided
-    if not target_asset_id:
+    # 2. Operational question requiring an asset ID when none is provided
+    if q_type in {
+        "production_status",
+        "downtime",
+        "consecutive_downtime",
+        "maintenance_recurrence",
+        "safety_compliance",
+    } and not target_asset_id:
         category_labels = {
             "production_status": "production status",
             "downtime": "estimated downtime",
@@ -502,7 +580,7 @@ def process_assistant_question(
             answer=f"Please specify the well asset ID (e.g. WELL-0001) to check {label}.",
         )
 
-    # 4. Route to deterministic handler
+    # 3. Route to deterministic handler if it is one of the 5 operational categories
     root = dataset_root or DATASET_ROOT
     if q_type == "production_status":
         return _handle_production_status(target_asset_id, root, clean_question)
@@ -515,11 +593,5 @@ def process_assistant_question(
     elif q_type == "safety_compliance":
         return _handle_safety_compliance(target_asset_id, root, clean_question)
 
-    # Fallback
-    return AssistantAskResponse(
-        question=clean_question,
-        asset_id=target_asset_id,
-        question_type="unsupported",
-        status="unsupported",
-        answer="Unable to process question.",
-    )
+    # 4. Route to Document Retrieval for documentary questions outside the 5 deterministic handlers
+    return _handle_document_retrieval(clean_question, target_asset_id, root)
