@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
 
 app = FastAPI(title="Asset Intelligence Copilot")
 
@@ -116,7 +117,7 @@ def health():
 
 
 @app.get("/api/wells/{asset_id}/status")
-def get_well_status(asset_id: str):
+def get_well_status(asset_id: str, dataset_root: Path | None = None):
     # Prevent path traversal: accept only simple asset IDs.
     if not asset_id or any(
         character not in "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
@@ -125,7 +126,8 @@ def get_well_status(asset_id: str):
     ):
         raise HTTPException(status_code=400, detail="Invalid asset ID")
 
-    asset_dir = DATASET_ROOT / "sample-data" / "assets" / asset_id
+    root = dataset_root or DATASET_ROOT
+    asset_dir = root / "sample-data" / "assets" / asset_id
     metadata_path = asset_dir / "metadata.json"
     inspections_path = asset_dir / "inspections.jsonl"
     context_path = asset_dir / "context.jsonl"
@@ -403,3 +405,20 @@ def get_safety_compliance_endpoint(
         asset_id=asset_id,
         dataset_root=DATASET_ROOT,
     )
+
+
+class AssistantAskRequest(BaseModel):
+    question: str = ""
+    asset_id: str | None = None
+
+
+@app.post("/api/assistant/ask")
+def assistant_ask_endpoint(request: AssistantAskRequest):
+    from app.assistant import process_assistant_question
+
+    return process_assistant_question(
+        question=request.question,
+        asset_id=request.asset_id,
+        dataset_root=DATASET_ROOT,
+    )
+
