@@ -667,3 +667,14 @@ def test_malformed_context_jsonl_lines_skipped_safely(monkeypatch, tmp_path):
     data = response.json()
     assert data["has_correction"] is True
     assert data["corrections"][0]["note_id"] == "CTX-VALID-01"
+
+
+def test_list_wells_endpoint():
+    response = client.get("/api/wells")
+    assert response.status_code == 200
+    data = response.json()
+    assert "wells" in data
+    assert len(data["wells"]) > 0
+    well_ids = [w["asset_id"] for w in data["wells"]]
+    assert "WELL-0001" in well_ids
+    assert "WELL-0002" in well_ids

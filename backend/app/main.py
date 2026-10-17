@@ -5,9 +5,18 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 app = FastAPI(title="Asset Intelligence Copilot")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # This points to the dataset repository beside the application repository.
 DATASET_ROOT = Path(
@@ -114,6 +123,36 @@ def calculate_production_status(
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.get("/api/wells")
+def list_wells_endpoint(dataset_root: Path | None = None):
+    root = dataset_root or DATASET_ROOT
+    assets_dir = root / "sample-data" / "assets"
+    if not assets_dir.is_dir():
+        return {"wells": []}
+
+    wells = []
+    for d in sorted(assets_dir.iterdir()):
+        if d.is_dir() and d.name.startswith("WELL-"):
+            meta_path = d / "metadata.json"
+            well_type = None
+            name = None
+            if meta_path.is_file():
+                try:
+                    with meta_path.open("r", encoding="utf-8-sig") as f:
+                        meta = json.load(f)
+                        if isinstance(meta, dict):
+                            well_type = meta.get("well_type")
+                            name = meta.get("name")
+                except Exception:
+                    pass
+            wells.append({
+                "asset_id": d.name,
+                "well_type": well_type,
+                "name": name,
+            })
+    return {"wells": wells}
 
 
 @app.get("/api/wells/{asset_id}/status")
@@ -405,6 +444,27 @@ def get_safety_compliance_endpoint(
         asset_id=asset_id,
         dataset_root=DATASET_ROOT,
     )
+
+
+@app.get("/api/fleet/repair-types")
+def get_fleet_repair_types_endpoint():
+    from app.operational_intelligence import get_repair_types_summary
+
+    return get_repair_types_summary(
+        asset_id=None,
+        dataset_root=DATASET_ROOT,
+    )
+
+
+@app.get("/api/wells/{asset_id}/repair-types")
+def get_well_repair_types_endpoint(asset_id: str):
+    from app.operational_intelligence import get_repair_types_summary
+
+    return get_repair_types_summary(
+        asset_id=asset_id,
+        dataset_root=DATASET_ROOT,
+    )
+
 
 
 class AssistantAskRequest(BaseModel):

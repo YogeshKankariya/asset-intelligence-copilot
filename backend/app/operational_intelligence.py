@@ -1,6 +1,7 @@
 import datetime
 import json
 import math
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -724,3 +725,164 @@ def check_safety_and_compliance(
             "Explicit false-positive spill corrections in context notes are excluded per SOP-SR Section 7."
         ),
     }
+
+
+def get_repair_types_summary(
+    asset_id: str | None = None,
+    dataset_root: Path | None = None,
+) -> dict[str, Any]:
+    """Summarizes maintenance and repair types, categories, and frequencies
+    from operational maintenance records.
+
+    Differentiates between:
+    1. Maintenance action types (maintenance_type): 'scheduled' (preventive) vs 'corrective' (repairs)
+    2. Equipment categories repaired (equipment_kind): 'flowline', 'pump_jack', 'wellhead',
+       'downhole_pump', 'rod_string', 'separator'
+
+    Supports both asset-scoped queries (asset_id provided) and fleet-wide inquiries (asset_id is None).
+    """
+    root = dataset_root or DATASET_ROOT
+    evidence: list[dict[str, Any]] = []
+
+    if asset_id is not None:
+        _validate_asset_id(asset_id)
+        asset_dir = root / "sample-data" / "assets" / asset_id
+        metadata_path = asset_dir / "metadata.json"
+        if not metadata_path.is_file():
+            raise HTTPException(status_code=404, detail="Well not found")
+        metadata = load_json(metadata_path)
+        if metadata.get("asset_id") != asset_id:
+            raise HTTPException(status_code=500, detail="Asset ID mismatch")
+
+        maintenance_path = asset_dir / "maintenance.jsonl"
+        raw_records = load_maintenance(maintenance_path)
+        records = [
+            r
+            for r in raw_records
+            if isinstance(r, dict)
+            and (not r.get("asset_id") or r.get("asset_id") == asset_id)
+        ]
+        scope = "asset"
+        scope_desc = f"well {asset_id}"
+    else:
+        # Fleet-wide aggregation
+        assets_dir = root / "sample-data" / "assets"
+        records = []
+        if assets_dir.is_dir():
+            for mpath in sorted(assets_dir.glob("*/maintenance.jsonl")):
+                for r in load_maintenance(mpath):
+                    if isinstance(r, dict):
+                        records.append(r)
+        scope = "fleet"
+        scope_desc = "the entire fleet"
+
+    total_records = len(records)
+    maintenance_types: Counter[str] = Counter()
+    all_equipment_kinds: Counter[str] = Counter()
+    corrective_equipment_kinds: Counter[str] = Counter()
+    corrective_issues: Counter[str] = Counter()
+    corrective_actions: Counter[str] = Counter()
+    sample_corrective_records = []
+
+    for r in records:
+        m_type = str(r.get("maintenance_type") or "unspecified").lower()
+        maintenance_types[m_type] += 1
+
+        eq_kind = str(r.get("equipment_kind") or "unspecified").lower()
+        all_equipment_kinds[eq_kind] += 1
+
+        if m_type == "corrective":
+            corrective_equipment_kinds[eq_kind] += 1
+            if r.get("issue"):
+                corrective_issues[str(r.get("issue"))] += 1
+            if r.get("action_taken"):
+                corrective_actions[str(r.get("action_taken"))] += 1
+            if len(sample_corrective_records) < 5:
+                sample_corrective_records.append(r)
+
+    # Build evidence citations
+    if scope == "asset":
+        for r in sample_corrective_records:
+            evidence.append(
+                {
+                    "record_id": r.get("maintenance_id"),
+                    "maintenance_id": r.get("maintenance_id"),
+                    "source": f"assets/{asset_id}/maintenance.jsonl",
+                    "record_type": "maintenance_record",
+                    "maintenance_type": r.get("maintenance_type"),
+                    "equipment_kind": r.get("equipment_kind"),
+                    "issue": r.get("issue"),
+                }
+            )
+    else:
+        evidence.append(
+            {
+                "source": "sample-data/assets/*/maintenance.jsonl",
+                "document_title": "Operational Maintenance Logs",
+                "section": "Repairs (assets/WELL-XXXX/maintenance.jsonl)",
+                "record_type": "dataset_records",
+                "excerpt": f"Aggregated {total_records} operational maintenance records across all fleet assets.",
+            }
+        )
+        evidence.append(
+            {
+                "source": "02-dataset-guide.md",
+                "document_title": "Dataset Guide",
+                "section": "Repairs (assets/WELL-XXXX/maintenance.jsonl)",
+                "record_type": "dataset_guide",
+                "excerpt": "Repairs are recorded in maintenance.jsonl with maintenance_type ('scheduled' or 'corrective') and equipment_kind.",
+            }
+        )
+        for r in sample_corrective_records[:3]:
+            r_asset = r.get("asset_id") or "fleet"
+            evidence.append(
+                {
+                    "record_id": r.get("maintenance_id"),
+                    "maintenance_id": r.get("maintenance_id"),
+                    "source": f"assets/{r_asset}/maintenance.jsonl",
+                    "record_type": "maintenance_record",
+                    "maintenance_type": r.get("maintenance_type"),
+                    "equipment_kind": r.get("equipment_kind"),
+                    "issue": r.get("issue"),
+                }
+            )
+
+    top_issues = [
+        {"issue": issue, "count": count}
+        for issue, count in corrective_issues.most_common(5)
+    ]
+    top_actions = [
+        {"action": action, "count": count}
+        for action, count in corrective_actions.most_common(5)
+    ]
+
+    equipment_list_str = (
+        ", ".join(sorted(corrective_equipment_kinds.keys()))
+        if corrective_equipment_kinds
+        else "none"
+    )
+    explanation = (
+        f"In operational records for {scope_desc}, maintenance events are divided into 2 primary types: "
+        f"'scheduled' (preventive servicing) and 'corrective' (unscheduled repairs). "
+        f"Corrective repairs address failures across {len(corrective_equipment_kinds)} distinct equipment categories "
+        f"({equipment_list_str})."
+    )
+
+    return {
+        "scope": scope,
+        "asset_id": asset_id,
+        "total_records": total_records,
+        "maintenance_types": dict(maintenance_types),
+        "maintenance_type_count": len(maintenance_types),
+        "corrective_count": maintenance_types.get("corrective", 0),
+        "scheduled_count": maintenance_types.get("scheduled", 0),
+        "equipment_kind_count": len(all_equipment_kinds),
+        "corrective_equipment_kind_count": len(corrective_equipment_kinds),
+        "corrective_equipment_kinds": dict(corrective_equipment_kinds),
+        "all_equipment_kinds": dict(all_equipment_kinds),
+        "top_corrective_issues": top_issues,
+        "top_corrective_actions": top_actions,
+        "evidence": evidence,
+        "explanation": explanation,
+    }
+

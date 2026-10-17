@@ -432,6 +432,12 @@ def validate_deterministic_preservation(
             if "requires a root-cause analysis" in synth_lower and "does not require" not in synth_lower:
                 return False
 
+    elif question_type == "repair_types":
+        if "corrective" in base_lower and "corrective" not in synth_lower:
+            return False
+        if "scheduled" in base_lower and "scheduled" not in synth_lower:
+            return False
+
     return True
 
 

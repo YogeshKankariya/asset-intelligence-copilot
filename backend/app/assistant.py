@@ -26,6 +26,7 @@ from app.operational_intelligence import (
     check_consecutive_downtime,
     check_maintenance_recurrence,
     check_safety_and_compliance,
+    get_repair_types_summary,
 )
 
 
@@ -119,6 +120,25 @@ def classify_question(question: str, has_asset_id: bool) -> str:
         or (re.search(r"\btemperature difference\b", q) and re.search(r"\bthreshold\b", q))
     )
 
+    # 6. Repair and maintenance types / categories aggregation
+    is_doc_query = bool(
+        re.search(r"\b(sop|manual|protocol|procedure|policy|guideline|work instruction)\b", q)
+    )
+    is_repair_types = bool(
+        not is_doc_query
+        and not re.search(r"\bmnt-[\w-]+\b", q)
+        and (
+            re.search(r"\b(types?|kinds?|categories|classification)\b.*\b(repairs?|maintenance)\b", q)
+            or re.search(r"\b(repairs?|maintenance)\b.*\b(types?|kinds?|categories|classification)\b", q)
+            or re.search(r"\bhow many\b.*\b(types of repairs|repair types|types of maintenance|maintenance types|repairs)\b", q)
+            or re.search(r"\b(repair|maintenance)\s+(breakdown|summary|counts?|types?)\b", q)
+        )
+        and not is_consecutive_downtime
+        and not is_downtime
+        and not is_maintenance
+        and not is_safety
+    )
+
     matched = []
     if is_consecutive_downtime:
         matched.append("consecutive_downtime")
@@ -130,6 +150,8 @@ def classify_question(question: str, has_asset_id: bool) -> str:
         matched.append("safety_compliance")
     if is_production:
         matched.append("production_status")
+    if is_repair_types:
+        matched.append("repair_types")
 
     if len(matched) > 1:
         return "ambiguous"
@@ -496,6 +518,71 @@ def _handle_document_retrieval(
     )
 
 
+def _handle_repair_types(
+    asset_id: str | None,
+    dataset_root: Path | None,
+    question: str,
+) -> AssistantAskResponse:
+    res = get_repair_types_summary(asset_id=asset_id, dataset_root=dataset_root)
+
+    scope = res["scope"]
+    total_records = res["total_records"]
+    scheduled_count = res["scheduled_count"]
+    corrective_count = res["corrective_count"]
+    corrective_kinds = res["corrective_equipment_kinds"]
+    target_desc = f"for well **{asset_id}**" if scope == "asset" else "across the **entire fleet**"
+
+    sched_pct = f" ({scheduled_count / total_records * 100:.1f}%)" if total_records > 0 else ""
+    corr_pct = f" ({corrective_count / total_records * 100:.1f}%)" if total_records > 0 else ""
+
+    lines = [
+        f"Operational records {target_desc} contain a total of **{total_records} maintenance event(s)**. "
+        "In the operational dataset, maintenance is categorized across two operational dimensions:\n",
+        "### 1. Maintenance Action Types (`maintenance_type`)",
+        f"- **Corrective Maintenance (Repairs)**: **{corrective_count}** event(s){corr_pct}. "
+        "Unscheduled repair jobs performed in response to equipment breakdown, leaks, wear, or alarms.",
+        f"- **Scheduled Maintenance (Preventive)**: **{scheduled_count}** event(s){sched_pct}. "
+        "Routine servicing, lubrication, belt inspections, and annual tests.\n",
+        f"### 2. Equipment Categories Repaired (`equipment_kind`)",
+        f"Corrective repairs were performed across **{len(corrective_kinds)} equipment subsystem(s)**:\n",
+        "| Equipment Subsystem | Corrective Repairs | Distribution |",
+        "| ------------------- | ------------------ | ------------ |",
+    ]
+
+    for eq, cnt in sorted(corrective_kinds.items(), key=lambda x: x[1], reverse=True):
+        eq_pct = f"{cnt / corrective_count * 100:.1f}%" if corrective_count > 0 else "0.0%"
+        eq_title = eq.replace("_", " ").title()
+        lines.append(f"| {eq_title} (`{eq}`) | {cnt} | {eq_pct} |")
+
+    top_issues = res.get("top_corrective_issues", [])
+    if top_issues:
+        lines.append("\n### Most Frequent Corrective Issues")
+        for item in top_issues:
+            lines.append(f"- **{item['issue']}**: {item['count']} repair(s)")
+
+    lines.append(
+        "\nEvidence Grounding: Counts and categories are calculated directly from `maintenance.jsonl` records."
+    )
+
+    rule_or_calc = (
+        f"Dataset maintenance schema per 02-dataset-guide.md: maintenance_type in {'scheduled', 'corrective'} "
+        f"across functional equipment kinds. Aggregated {total_records} record(s) {target_desc}."
+    )
+
+    return AssistantAskResponse(
+        question=question,
+        asset_id=asset_id,
+        question_type="repair_types",
+        status="answered",
+        answer="\n".join(lines),
+        rule_or_calculation=rule_or_calc,
+        evidence=res.get("evidence", []),
+        conflicts=[],
+        unresolved_conflicts=False,
+        details=res,
+    )
+
+
 def process_assistant_question(
     question: str,
     asset_id: str | None = None,
@@ -580,7 +667,7 @@ def process_assistant_question(
             answer=f"Please specify the well asset ID (e.g. WELL-0001) to check {label}.",
         )
 
-    # 3. Route to deterministic handler if it is one of the 5 operational categories
+    # 3. Route to deterministic handler if it is one of the operational categories
     root = dataset_root or DATASET_ROOT
     if q_type == "production_status":
         base_resp = _handle_production_status(target_asset_id, root, clean_question)
@@ -592,8 +679,10 @@ def process_assistant_question(
         base_resp = _handle_maintenance_recurrence(target_asset_id, root, clean_question)
     elif q_type == "safety_compliance":
         base_resp = _handle_safety_compliance(target_asset_id, root, clean_question)
+    elif q_type == "repair_types":
+        base_resp = _handle_repair_types(target_asset_id, root, clean_question)
     else:
-        # 4. Route to Document Retrieval for documentary questions outside the 5 deterministic handlers
+        # 4. Route to Document Retrieval for documentary questions outside the deterministic handlers
         base_resp = _handle_document_retrieval(clean_question, target_asset_id, root)
 
     from app.llm_synthesis import synthesize_grounded_answer
