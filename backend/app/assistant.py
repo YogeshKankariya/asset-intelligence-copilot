@@ -583,15 +583,19 @@ def process_assistant_question(
     # 3. Route to deterministic handler if it is one of the 5 operational categories
     root = dataset_root or DATASET_ROOT
     if q_type == "production_status":
-        return _handle_production_status(target_asset_id, root, clean_question)
+        base_resp = _handle_production_status(target_asset_id, root, clean_question)
     elif q_type == "downtime":
-        return _handle_downtime(target_asset_id, root, clean_question)
+        base_resp = _handle_downtime(target_asset_id, root, clean_question)
     elif q_type == "consecutive_downtime":
-        return _handle_consecutive_downtime(target_asset_id, root, clean_question)
+        base_resp = _handle_consecutive_downtime(target_asset_id, root, clean_question)
     elif q_type == "maintenance_recurrence":
-        return _handle_maintenance_recurrence(target_asset_id, root, clean_question)
+        base_resp = _handle_maintenance_recurrence(target_asset_id, root, clean_question)
     elif q_type == "safety_compliance":
-        return _handle_safety_compliance(target_asset_id, root, clean_question)
+        base_resp = _handle_safety_compliance(target_asset_id, root, clean_question)
+    else:
+        # 4. Route to Document Retrieval for documentary questions outside the 5 deterministic handlers
+        base_resp = _handle_document_retrieval(clean_question, target_asset_id, root)
 
-    # 4. Route to Document Retrieval for documentary questions outside the 5 deterministic handlers
-    return _handle_document_retrieval(clean_question, target_asset_id, root)
+    from app.llm_synthesis import synthesize_grounded_answer
+
+    return synthesize_grounded_answer(base_resp)
