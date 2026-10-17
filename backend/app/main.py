@@ -127,8 +127,8 @@ def health():
 
 @app.get("/api/wells")
 def list_wells_endpoint(dataset_root: Path | None = None):
-    root = dataset_root or DATASET_ROOT
-    assets_dir = root / "sample-data" / "assets"
+    from app.config import resolve_assets_root
+    assets_dir = resolve_assets_root(dataset_root or DATASET_ROOT)
     if not assets_dir.is_dir():
         return {"wells": []}
 
@@ -165,8 +165,8 @@ def get_well_status(asset_id: str, dataset_root: Path | None = None):
     ):
         raise HTTPException(status_code=400, detail="Invalid asset ID")
 
-    root = dataset_root or DATASET_ROOT
-    asset_dir = root / "sample-data" / "assets" / asset_id
+    from app.config import resolve_asset_dir
+    asset_dir = resolve_asset_dir(asset_id, dataset_root or DATASET_ROOT)
     metadata_path = asset_dir / "metadata.json"
     inspections_path = asset_dir / "inspections.jsonl"
     context_path = asset_dir / "context.jsonl"
@@ -470,6 +470,9 @@ def get_well_repair_types_endpoint(asset_id: str):
 class AssistantAskRequest(BaseModel):
     question: str = ""
     asset_id: str | None = None
+    session_id: str | None = None
+    user_id: str | None = None
+    user_name: str | None = None
 
 
 @app.post("/api/assistant/ask")
@@ -479,6 +482,9 @@ def assistant_ask_endpoint(request: AssistantAskRequest):
     return process_assistant_question(
         question=request.question,
         asset_id=request.asset_id,
+        session_id=request.session_id,
+        user_id=request.user_id,
+        user_name=request.user_name,
         dataset_root=DATASET_ROOT,
     )
 
