@@ -72,6 +72,28 @@ def load_inspections(path: Path) -> list[dict[str, Any]]:
     return records
 
 
+def load_context(path: Path) -> list[dict[str, Any]]:
+    if not path.is_file():
+        return []
+
+    records = []
+    try:
+        with path.open("r", encoding="utf-8-sig", errors="replace") as file:
+            for line in file:
+                line_str = line.strip()
+                if line_str:
+                    try:
+                        record = json.loads(line_str)
+                        if isinstance(record, dict):
+                            records.append(record)
+                    except json.JSONDecodeError:
+                        continue
+    except OSError:
+        return []
+
+    return records
+
+
 def calculate_production_status(
     wellhead_temp_c: float,
     ambient_temp_c: float,
@@ -106,6 +128,7 @@ def get_well_status(asset_id: str):
     asset_dir = DATASET_ROOT / "sample-data" / "assets" / asset_id
     metadata_path = asset_dir / "metadata.json"
     inspections_path = asset_dir / "inspections.jsonl"
+    context_path = asset_dir / "context.jsonl"
 
     if not metadata_path.is_file():
         raise HTTPException(status_code=404, detail="Well not found")
@@ -119,6 +142,14 @@ def get_well_status(asset_id: str):
     threshold = get_well_type_threshold(well_type)
 
     inspections = load_inspections(inspections_path)
+    context_records = load_context(context_path)
+
+    # Filter context records belonging to this asset
+    asset_notes = [
+        note
+        for note in context_records
+        if isinstance(note, dict) and note.get("asset_id") == asset_id
+    ]
 
     # Keep only records belonging to this asset and containing valid readings.
     valid_inspections = []
@@ -174,34 +205,139 @@ def get_well_status(asset_id: str):
         )
 
     # ISO 8601 UTC timestamps sort chronologically for this dataset.
-    latest = max(
-        valid_inspections,
-        key=lambda record: record["inspected_at"],
-    )
+    max_timestamp = max(record["inspected_at"] for record in valid_inspections)
+    latest_candidates = [
+        record
+        for record in valid_inspections
+        if record["inspected_at"] == max_timestamp
+    ]
 
-    production = calculate_production_status(
-        wellhead_temp_c=latest["wellhead_temp_c"],
-        ambient_temp_c=latest["ambient_temp_c"],
-        threshold_c=threshold,
-    )
+    candidate_statuses = {}
+    for cand in latest_candidates:
+        cand_status = calculate_production_status(
+            wellhead_temp_c=cand["wellhead_temp_c"],
+            ambient_temp_c=cand["ambient_temp_c"],
+            threshold_c=threshold,
+        )
+        candidate_statuses[cand["inspection_id"]] = cand_status
+
+    unique_statuses = {s["computed_status"] for s in candidate_statuses.values()}
+
+    latest = latest_candidates[0]
+    production = candidate_statuses[latest["inspection_id"]]
+
+    conflicts = []
+    has_unresolved_inspection_conflict = len(unique_statuses) > 1
+
+    if has_unresolved_inspection_conflict:
+        conflicts.append(
+            {
+                "source": f"assets/{asset_id}/inspections.jsonl",
+                "field": "computed_status",
+                "conflicting_records": [c["inspection_id"] for c in latest_candidates],
+                "description": (
+                    f"Multiple inspection records exist for timestamp '{max_timestamp}' "
+                    "with contradictory production statuses."
+                ),
+                "resolution": None,
+                "is_resolved": False,
+            }
+        )
+
+    # Check for explicit valid corrections for the latest inspection
+    # Per dataset guide: note_type == "correction" targets inspection_id
+    corrections = []
+    for note in asset_notes:
+        if (
+            note.get("note_type") == "correction"
+            and note.get("inspection_id") == latest["inspection_id"]
+        ):
+            corrections.append(
+                {
+                    "note_id": note.get("note_id"),
+                    "inspection_id": note.get("inspection_id"),
+                    "note_type": "correction",
+                    "text": note.get("text"),
+                    "created_at": note.get("created_at"),
+                    "author_user_id": note.get("author_user_id"),
+                    "source": f"assets/{asset_id}/context.jsonl",
+                }
+            )
+
+    # Check for conflict with metadata recorded_status
+    recorded_status = metadata.get("recorded_status")
+    if recorded_status and isinstance(recorded_status, str):
+        recorded_as_producing = recorded_status.lower() == "active"
+        is_producing = production["computed_status"] == "producing"
+        if recorded_as_producing != is_producing:
+            conflicts.append(
+                {
+                    "source": f"assets/{asset_id}/metadata.json",
+                    "field": "recorded_status",
+                    "value": recorded_status,
+                    "conflicts_with": "computed_status",
+                    "description": (
+                        f"Recorded status '{recorded_status}' in metadata disagrees with "
+                        f"computed status '{production['computed_status']}' from latest inspection."
+                    ),
+                    "resolution": "inspections_take_precedence",
+                    "is_resolved": True,
+                }
+            )
+
+    # Determine status and conflict resolution state
+    if has_unresolved_inspection_conflict:
+        computed_status = "conflict"
+        status_basis = "conflicting_inspection_records"
+        conflict_status = "unresolved"
+    else:
+        computed_status = production["computed_status"]
+        status_basis = "latest_valid_inspection"
+        conflict_status = (
+            "resolved_by_inspection_precedence" if conflicts else "none"
+        )
+
+    # Build evidence records identifying source records and timestamps
+    evidence = []
+    for cand in latest_candidates:
+        evidence.append(
+            {
+                "inspection_id": cand["inspection_id"],
+                "record_id": cand["inspection_id"],
+                "source": f"assets/{asset_id}/inspections.jsonl",
+                "timestamp": cand["inspected_at"],
+                "record_type": "inspection",
+            }
+        )
+
+    for corr in corrections:
+        evidence.append(
+            {
+                "record_id": corr["note_id"],
+                "source": corr["source"],
+                "timestamp": corr.get("created_at"),
+                "record_type": "correction",
+                "description": corr.get("text"),
+            }
+        )
 
     return {
         "asset_id": asset_id,
         "asset_name": metadata.get("name"),
         "well_type": well_type,
-        "computed_status": production["computed_status"],
-        "status_basis": "latest_valid_inspection",
+        "computed_status": computed_status,
+        "status_basis": status_basis,
+        "recorded_status": recorded_status,
         "inspection_timestamp": latest["inspected_at"],
         "ambient_temp_c": latest["ambient_temp_c"],
         "wellhead_temp_c": latest["wellhead_temp_c"],
         "temperature_difference_c": production["temperature_difference_c"],
         "threshold_c": production["threshold_c"],
-        "evidence": [
-            {
-                "inspection_id": latest["inspection_id"],
-                "source": f"assets/{asset_id}/inspections.jsonl",
-            }
-        ],
+        "evidence": evidence,
+        "has_correction": len(corrections) > 0,
+        "corrections": corrections,
+        "conflicts": conflicts,
+        "conflict_status": conflict_status,
         "note": (
             "This is the status inferred from the latest valid inspection, "
             "not a guarantee of the well's current physical state."

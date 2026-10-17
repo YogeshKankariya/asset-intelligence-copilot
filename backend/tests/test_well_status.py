@@ -99,6 +99,7 @@ def _setup_test_asset(
     asset_id="WELL-0001",
     metadata_content='{"asset_id": "WELL-0001", "name": "Test Well", "well_type": "T200"}',
     inspections_lines=None,
+    context_lines=None,
 ):
     asset_dir = tmp_path / "sample-data" / "assets" / asset_id
     asset_dir.mkdir(parents=True, exist_ok=True)
@@ -107,6 +108,10 @@ def _setup_test_asset(
     if inspections_lines is not None:
         (asset_dir / "inspections.jsonl").write_text(
             "\n".join(inspections_lines) + "\n", encoding="utf-8"
+        )
+    if context_lines is not None:
+        (asset_dir / "context.jsonl").write_text(
+            "\n".join(context_lines) + "\n", encoding="utf-8"
         )
     return asset_dir
 
@@ -404,3 +409,261 @@ def test_get_well_type_threshold_helper():
         get_well_type_threshold(None)
     assert exc_info.value.status_code == 422
     assert "None" in exc_info.value.detail
+
+
+def test_evidence_includes_source_record_and_timestamp():
+    response = client.get("/api/wells/WELL-0001/status")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert "evidence" in data
+    assert len(data["evidence"]) >= 1
+
+    inspection_evidence = data["evidence"][0]
+    assert inspection_evidence["inspection_id"] == "INS-0001-0203"
+    assert inspection_evidence["record_id"] == "INS-0001-0203"
+    assert inspection_evidence["source"] == "assets/WELL-0001/inspections.jsonl"
+    assert inspection_evidence["timestamp"] == "2026-10-15T09:45:00Z"
+    assert inspection_evidence["timestamp"] == data["inspection_timestamp"]
+    assert inspection_evidence["record_type"] == "inspection"
+
+
+def test_recorded_status_disagreement_reported_as_conflict():
+    # In real dataset, WELL-0001 has computed_status "not_producing" but recorded_status "active"
+    response = client.get("/api/wells/WELL-0001/status")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["computed_status"] == "not_producing"
+    assert data["recorded_status"] == "active"
+    assert data["conflict_status"] == "resolved_by_inspection_precedence"
+    assert len(data["conflicts"]) == 1
+
+    conflict = data["conflicts"][0]
+    assert conflict["field"] == "recorded_status"
+    assert conflict["value"] == "active"
+    assert conflict["conflicts_with"] == "computed_status"
+    assert conflict["resolution"] == "inspections_take_precedence"
+    assert conflict["is_resolved"] is True
+
+
+def test_no_conflict_when_recorded_status_matches_computed_status(monkeypatch, tmp_path):
+    monkeypatch.setattr("app.main.DATASET_ROOT", tmp_path)
+    lines = [
+        (
+            '{"inspection_id": "INS-MATCH-01", "asset_id": "WELL-0001", '
+            '"inspected_at": "2026-10-15T11:00:00Z", "ambient_temp_c": 20.0, '
+            '"wellhead_temp_c": 36.0}'
+        ),
+    ]
+    _setup_test_asset(
+        tmp_path,
+        metadata_content=(
+            '{"asset_id": "WELL-0001", "name": "Well", "well_type": "T200", '
+            '"recorded_status": "active"}'
+        ),
+        inspections_lines=lines,
+    )
+
+    response = client.get("/api/wells/WELL-0001/status")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["computed_status"] == "producing"
+    assert data["recorded_status"] == "active"
+    assert data["conflicts"] == []
+    assert data["conflict_status"] == "none"
+
+
+def test_explicit_valid_correction_included_in_evidence_and_corrections(monkeypatch, tmp_path):
+    monkeypatch.setattr("app.main.DATASET_ROOT", tmp_path)
+    lines = [
+        (
+            '{"inspection_id": "INS-CORR-01", "asset_id": "WELL-0001", '
+            '"inspected_at": "2026-10-15T11:00:00Z", "ambient_temp_c": 20.0, '
+            '"wellhead_temp_c": 36.0}'
+        ),
+    ]
+    context = [
+        (
+            '{"asset_id": "WELL-0001", "created_at": "2026-10-15T16:00:00Z", '
+            '"author_user_id": "U-401", "note_type": "correction", '
+            '"inspection_id": "INS-CORR-01", "note_id": "CTX-0001-009", '
+            '"text": "Sensor reading corrected: wellhead was reading 5C high due to sensor drift.", '
+            '"valid_from": "2026-10-15", "valid_to": null}'
+        ),
+    ]
+    _setup_test_asset(
+        tmp_path,
+        inspections_lines=lines,
+        context_lines=context,
+    )
+
+    response = client.get("/api/wells/WELL-0001/status")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["has_correction"] is True
+    assert len(data["corrections"]) == 1
+
+    corr = data["corrections"][0]
+    assert corr["note_id"] == "CTX-0001-009"
+    assert corr["inspection_id"] == "INS-CORR-01"
+    assert corr["note_type"] == "correction"
+    assert corr["author_user_id"] == "U-401"
+    assert corr["source"] == "assets/WELL-0001/context.jsonl"
+
+    # Both inspection and correction appear in evidence
+    evidence_types = [e["record_type"] for e in data["evidence"]]
+    assert "inspection" in evidence_types
+    assert "correction" in evidence_types
+    correction_evidence = [e for e in data["evidence"] if e["record_type"] == "correction"][0]
+    assert correction_evidence["record_id"] == "CTX-0001-009"
+    assert correction_evidence["timestamp"] == "2026-10-15T16:00:00Z"
+
+
+def test_ordinary_operator_notes_are_not_treated_as_corrections(monkeypatch, tmp_path):
+    monkeypatch.setattr("app.main.DATASET_ROOT", tmp_path)
+    lines = [
+        (
+            '{"inspection_id": "INS-NOTE-01", "asset_id": "WELL-0001", '
+            '"inspected_at": "2026-10-15T11:00:00Z", "ambient_temp_c": 20.0, '
+            '"wellhead_temp_c": 36.0}'
+        ),
+    ]
+    context = [
+        (
+            '{"asset_id": "WELL-0001", "created_at": "2026-10-15T16:00:00Z", '
+            '"author_user_id": "U-102", "note_type": "operator_note", '
+            '"note_id": "CTX-0001-010", "text": "Ordinary technician note on operation", '
+            '"valid_from": "2026-10-15", "valid_to": null}'
+        ),
+        (
+            '{"asset_id": "WELL-0001", "created_at": "2026-10-15T17:00:00Z", '
+            '"author_user_id": "U-103", "note_type": "operator_feedback", '
+            '"note_id": "CTX-0001-011", "text": "Another operator remark", '
+            '"valid_from": "2026-10-15", "valid_to": null}'
+        ),
+    ]
+    _setup_test_asset(
+        tmp_path,
+        inspections_lines=lines,
+        context_lines=context,
+    )
+
+    response = client.get("/api/wells/WELL-0001/status")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["has_correction"] is False
+    assert data["corrections"] == []
+
+
+def test_correction_for_older_inspection_does_not_apply_to_current(monkeypatch, tmp_path):
+    monkeypatch.setattr("app.main.DATASET_ROOT", tmp_path)
+    lines = [
+        (
+            '{"inspection_id": "INS-OLD-01", "asset_id": "WELL-0001", '
+            '"inspected_at": "2026-10-01T11:00:00Z", "ambient_temp_c": 20.0, '
+            '"wellhead_temp_c": 36.0}'
+        ),
+        (
+            '{"inspection_id": "INS-NEW-02", "asset_id": "WELL-0001", '
+            '"inspected_at": "2026-10-15T11:00:00Z", "ambient_temp_c": 20.0, '
+            '"wellhead_temp_c": 36.0}'
+        ),
+    ]
+    # Correction points to INS-OLD-01, not INS-NEW-02
+    context = [
+        (
+            '{"asset_id": "WELL-0001", "created_at": "2026-10-02T16:00:00Z", '
+            '"author_user_id": "U-401", "note_type": "correction", '
+            '"inspection_id": "INS-OLD-01", "note_id": "CTX-OLD-001", '
+            '"text": "Old inspection correction", "valid_from": "2026-10-02", "valid_to": null}'
+        ),
+    ]
+    _setup_test_asset(
+        tmp_path,
+        inspections_lines=lines,
+        context_lines=context,
+    )
+
+    response = client.get("/api/wells/WELL-0001/status")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["inspection_timestamp"] == "2026-10-15T11:00:00Z"
+    assert data["has_correction"] is False
+    assert data["corrections"] == []
+
+
+def test_conflicting_inspection_records_at_same_timestamp_unresolved(monkeypatch, tmp_path):
+    monkeypatch.setattr("app.main.DATASET_ROOT", tmp_path)
+    # Two inspections at the exact same latest timestamp with contradictory statuses
+    lines = [
+        (
+            '{"inspection_id": "INS-CAND-01", "asset_id": "WELL-0001", '
+            '"inspected_at": "2026-10-15T11:00:00Z", "ambient_temp_c": 20.0, '
+            '"wellhead_temp_c": 40.0}'
+        ),
+        (
+            '{"inspection_id": "INS-CAND-02", "asset_id": "WELL-0001", '
+            '"inspected_at": "2026-10-15T11:00:00Z", "ambient_temp_c": 20.0, '
+            '"wellhead_temp_c": 25.0}'
+        ),
+    ]
+    _setup_test_asset(tmp_path, inspections_lines=lines)
+
+    response = client.get("/api/wells/WELL-0001/status")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["computed_status"] == "conflict"
+    assert data["conflict_status"] == "unresolved"
+    assert data["status_basis"] == "conflicting_inspection_records"
+
+    # Conflicting records are listed in conflicts and evidence
+    assert len(data["conflicts"]) >= 1
+    unresolved_conflict = [c for c in data["conflicts"] if not c["is_resolved"]][0]
+    assert "INS-CAND-01" in unresolved_conflict["conflicting_records"]
+    assert "INS-CAND-02" in unresolved_conflict["conflicting_records"]
+
+    evidence_ids = [e["inspection_id"] for e in data["evidence"] if "inspection_id" in e]
+    assert "INS-CAND-01" in evidence_ids
+    assert "INS-CAND-02" in evidence_ids
+
+
+def test_malformed_context_jsonl_lines_skipped_safely(monkeypatch, tmp_path):
+    monkeypatch.setattr("app.main.DATASET_ROOT", tmp_path)
+    lines = [
+        (
+            '{"inspection_id": "INS-0001", "asset_id": "WELL-0001", '
+            '"inspected_at": "2026-10-15T11:00:00Z", "ambient_temp_c": 20.0, '
+            '"wellhead_temp_c": 36.0}'
+        ),
+    ]
+    context = [
+        "{malformed context line",
+        '"not a dictionary"',
+        "[1, 2, 3]",
+        "   ",
+        (
+            '{"asset_id": "WELL-0001", "created_at": "2026-10-15T16:00:00Z", '
+            '"author_user_id": "U-401", "note_type": "correction", '
+            '"inspection_id": "INS-0001", "note_id": "CTX-VALID-01", '
+            '"text": "Valid correction after malformed lines", '
+            '"valid_from": "2026-10-15", "valid_to": null}'
+        ),
+    ]
+    _setup_test_asset(
+        tmp_path,
+        inspections_lines=lines,
+        context_lines=context,
+    )
+
+    response = client.get("/api/wells/WELL-0001/status")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["has_correction"] is True
+    assert data["corrections"][0]["note_id"] == "CTX-VALID-01"
