@@ -343,3 +343,63 @@ def get_well_status(asset_id: str):
             "not a guarantee of the well's current physical state."
         ),
     }
+
+
+@app.get("/api/wells/{asset_id}/downtime")
+def get_well_downtime_endpoint(
+    asset_id: str,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    year: int | None = None,
+):
+    from app.operational_intelligence import calculate_well_downtime
+
+    return calculate_well_downtime(
+        asset_id=asset_id,
+        start_date=start_date,
+        end_date=end_date,
+        year=year,
+        dataset_root=DATASET_ROOT,
+    )
+
+
+@app.get("/api/wells/{asset_id}/consecutive-downtime")
+def get_consecutive_downtime_endpoint(
+    asset_id: str,
+    threshold_days: int = 14,
+):
+    from app.operational_intelligence import check_consecutive_downtime
+
+    return check_consecutive_downtime(
+        asset_id=asset_id,
+        consecutive_days_threshold=threshold_days,
+        dataset_root=DATASET_ROOT,
+    )
+
+
+@app.get("/api/wells/{asset_id}/maintenance-recurrence")
+def get_maintenance_recurrence_endpoint(
+    asset_id: str,
+    window_days: int = 365,
+    min_events: int = 3,
+):
+    from app.operational_intelligence import check_maintenance_recurrence
+
+    return check_maintenance_recurrence(
+        asset_id=asset_id,
+        window_days=window_days,
+        min_events=min_events,
+        dataset_root=DATASET_ROOT,
+    )
+
+
+@app.get("/api/wells/{asset_id}/safety-compliance")
+def get_safety_compliance_endpoint(
+    asset_id: str,
+):
+    from app.operational_intelligence import check_safety_and_compliance
+
+    return check_safety_and_compliance(
+        asset_id=asset_id,
+        dataset_root=DATASET_ROOT,
+    )
