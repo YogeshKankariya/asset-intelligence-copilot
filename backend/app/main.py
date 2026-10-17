@@ -1,5 +1,6 @@
 
 import json
+import math
 from pathlib import Path
 from typing import Any
 
@@ -22,25 +23,36 @@ WELL_TYPE_THRESHOLDS = {
 def load_json(path: Path) -> dict[str, Any]:
     try:
         with path.open("r", encoding="utf-8-sig") as file:
-            return json.load(file)
+            data = json.load(file)
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail="Dataset file not found")
     except json.JSONDecodeError:
         raise HTTPException(status_code=500, detail="Invalid JSON in dataset")
 
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=500, detail="Invalid metadata format")
+
+    return data
+
 
 def load_inspections(path: Path) -> list[dict[str, Any]]:
-    if not path.exists():
+    if not path.is_file():
         return []
 
     records = []
-    with path.open("r", encoding="utf-8-sig") as file:
-        for line in file:
-            if line.strip():
-                try:
-                    records.append(json.loads(line))
-                except json.JSONDecodeError:
-                    continue
+    try:
+        with path.open("r", encoding="utf-8-sig", errors="replace") as file:
+            for line in file:
+                line_str = line.strip()
+                if line_str:
+                    try:
+                        record = json.loads(line_str)
+                        if isinstance(record, dict):
+                            records.append(record)
+                    except json.JSONDecodeError:
+                        continue
+    except OSError:
+        return []
 
     return records
 
@@ -102,16 +114,36 @@ def get_well_status(asset_id: str):
     # Keep only records belonging to this asset and containing valid readings.
     valid_inspections = []
     for inspection in inspections:
+        if not isinstance(inspection, dict):
+            continue
+
         if inspection.get("asset_id") != asset_id:
             continue
 
         try:
-            ambient = float(inspection["ambient_temp_c"])
-            wellhead = float(inspection["wellhead_temp_c"])
+            ambient_raw = inspection["ambient_temp_c"]
+            wellhead_raw = inspection["wellhead_temp_c"]
+
+            if isinstance(ambient_raw, bool) or isinstance(wellhead_raw, bool):
+                continue
+
+            ambient = float(ambient_raw)
+            wellhead = float(wellhead_raw)
+
+            if (
+                math.isnan(ambient)
+                or math.isinf(ambient)
+                or math.isnan(wellhead)
+                or math.isinf(wellhead)
+            ):
+                continue
+
             timestamp = inspection["inspected_at"]
             inspection_id = inspection["inspection_id"]
 
-            if not timestamp or not inspection_id:
+            if not isinstance(timestamp, str) or not timestamp.strip():
+                continue
+            if not isinstance(inspection_id, str) or not inspection_id.strip():
                 continue
         except (KeyError, TypeError, ValueError):
             continue
